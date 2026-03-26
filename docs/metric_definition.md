@@ -224,10 +224,32 @@ Line A 用稀疏全关节关键帧保住了姿态，但关键帧间距太大导�
 
 reconstruction guidance 通过梯度将非关键帧的根轨迹也拉向 GT 方向，弥补 imputation 的间隙。
 
+**实验进展（Line A → D → G）**:
+
+| 配置 | MPJPE | TrajE | RA-MPJPE | BFE | 关键帧策略 |
+|------|-------|-------|----------|-----|-----------|
+| line_a | 0.0505 | 0.0497 | 0.0092 | 0.0137 | 全关节 stride=5 |
+| line_d | 0.0394 | 0.0000 | 0.0394 | 0.0284 | root stride=1 + 9关节 stride=40 |
+| line_g | 0.0163 | 0.0000 | 0.0163 | 0.0077 | root stride=1 + 9关节 stride=5 |
+
+趋势分析：
+- D→G：joint stride 40→5，RA-MPJPE 0.039→0.016（关键帧密度有效）
+- G vs A：同为 stride=5，但 G 只有 9/22 关节，A 有 22/22 关节，RA-MPJPE 差 0.007
+- **残余误差完全来自未观测的 13 个关节**（脊柱链、膝、肘、肩、颈、头）
+
+**降至 MPJPE < 0.01 的调整方案**:
+
+在 Line G 基础上，保持 root stride=1 不变：
+
+| 调整 | 做法 | 预期 MPJPE |
+|------|------|-----------|
+| 扩大关节覆盖至全部 22 | 去掉 `--manual_observed_joints` 限制，joint stride=5 | ~0.009 |
+| 全关节 + stride=3 | 全关节，`--manual_observed_joint_stride 3` | ~0.005-0.007 |
+
 **策略优先级**:
 
 | 策略 | 预期 MPJPE | 实现难度 | 推荐 |
 |------|-----------|---------|------|
-| 策略 1: 根轨迹 + 稀疏关键帧 | ~0.009 | 已实现 | 首选 |
-| 策略 2: transition_length=2 | ~0.01-0.02 | 改参数 | 快速验证 |
-| 策略 3: +reconstruction guidance | ~0.02-0.03 | 加参数 | 叠加改善 |
+| root stride=1 + 全关节 stride=5 | ~0.009 | 改参数 | 首选 |
+| root stride=1 + 全关节 stride=3 | ~0.005-0.007 | 改参数 | 更激进 |
+| 上述 + reconstruction guidance | 再降 ~20-30% | 加参数 | 叠加改善 |
