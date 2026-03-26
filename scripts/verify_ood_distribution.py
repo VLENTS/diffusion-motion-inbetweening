@@ -35,7 +35,8 @@ from data_loaders.get_data import DatasetConfig, get_dataset_loader
 # 方法 1: Motion Embedding 提取 + t-SNE / UMAP 可视化
 # ============================================================
 
-def extract_motion_embeddings_from_mdm(model, motions, diffusion, t_probe=50):
+def extract_motion_embeddings_from_mdm(model, motions, diffusion, t_probe=50,
+                                       uncond_text=True):
     """
     通过在固定时间步 t_probe 对 x_0 加噪后送入模型，
     提取 Transformer encoder 输出作为 motion embedding。
@@ -45,6 +46,9 @@ def extract_motion_embeddings_from_mdm(model, motions, diffusion, t_probe=50):
         motions: [N, njoints, nfeats, nframes] 归一化后的动作张量
         diffusion: GaussianDiffusion 实例
         t_probe: 用于加噪的 diffusion timestep（越小噪声越少，特征越清晰）
+        uncond_text: True → 用 mask_cond(force_mask=True) 将文本 embedding 置零，
+                     这是模型训练时 CFG 无条件分支的真实行为。
+                     False → 传空串 '' 经 CLIP 编码，注意这仍然会产生非零向量。
 
     Returns:
         embeddings: [N, latent_dim] 每条动作的全局 embedding
@@ -63,12 +67,13 @@ def extract_motion_embeddings_from_mdm(model, motions, diffusion, t_probe=50):
             noise = torch.randn_like(batch)
             x_t = diffusion.q_sample(batch, t, noise=noise)
 
-            emb = model.embed_timestep(t)
+            emb = model.embed_timestep(t)  # [1, bs, d]
 
-            # encode text as empty (unconditioned)
             if 'text' in model.cond_mode:
                 enc_text = model.encode_text([''] * bs)
-                emb = emb + model.embed_text(enc_text)
+                # force_mask=True → zeros; 与 forward 中 y['uncond']=True 路径一致
+                text_emb = model.mask_cond(enc_text, force_mask=uncond_text)
+                emb = emb + model.embed_text(text_emb)
 
             x_proc = model.input_process(x_t)  # [nframes, bs, latent_dim]
 
@@ -76,8 +81,7 @@ def extract_motion_embeddings_from_mdm(model, motions, diffusion, t_probe=50):
             xseq = model.sequence_pos_encoder(xseq)
             output = model.seqTransEncoder(xseq)  # [nframes+1, bs, latent_dim]
 
-            # 取所有帧的均值作为全局表征
-            frame_features = output[1:]  # [nframes, bs, latent_dim]，去掉时间步 token
+            frame_features = output[1:]  # [nframes, bs, latent_dim]
             global_emb = frame_features.mean(dim=0)  # [bs, latent_dim]
             embeddings.append(global_emb.cpu().numpy())
 
@@ -127,7 +131,8 @@ def visualize_tsne(train_emb, target_emb, output_path, method='tsne'):
 # 方法 2: 逐样本 Diffusion 重建损失
 # ============================================================
 
-def compute_per_sample_loss(model, diffusion, motions, model_kwargs, n_timesteps=10):
+def compute_per_sample_loss(model, diffusion, motions, model_kwargs, n_timesteps=10,
+                            uncond_text=True):
     """
     对每个样本在多个 diffusion timestep 上计算重建损失，取均值。
     OOD 样本的重建损失通常显著高于训练分布内的样本。
@@ -138,6 +143,7 @@ def compute_per_sample_loss(model, diffusion, motions, model_kwargs, n_timesteps
         motions: [N, njoints, nfeats, nframes] 归一化动作
         model_kwargs: 包含 y['mask'], y['lengths'] 等信息的 dict
         n_timesteps: 采样的时间步数量
+        uncond_text: True → y['uncond']=True 使 mask_cond 置零文本 embedding
 
     Returns:
         per_sample_loss: [N] 每个样本的平均重建损失
@@ -162,6 +168,7 @@ def compute_per_sample_loss(model, diffusion, motions, model_kwargs, n_timesteps
                         'mask': model_kwargs['y']['mask'][i:i+32].to(device),
                         'lengths': model_kwargs['y']['lengths'][i:i+32],
                         'text': model_kwargs['y']['text'][i:i+32] if 'text' in model_kwargs['y'] else [''] * bs,
+                        'uncond': uncond_text,
                     }
                 }
                 if 'obs_x0' in model_kwargs:
@@ -329,13 +336,21 @@ def main():
                         help='embedding 提取时使用的 diffusion timestep')
     parser.add_argument('--vis_method', type=str, default='tsne',
                         choices=['tsne', 'umap'])
+    parser.add_argument('--uncond_text', action='store_true', default=True,
+                        help='（默认开启）用 mask_cond(force_mask=True) 将文本 embedding 置零，'
+                             '与 CFG 无条件分支一致，只比较运动先验。'
+                             '关闭则传空串经 CLIP 编码（仍为非零向量）。')
+    parser.add_argument('--no_uncond_text', dest='uncond_text', action='store_false',
+                        help='关闭无条件模式，使用 CLIP 编码的空串作为文本条件。')
     parser.add_argument('--device', type=str, default='cuda:0')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    text_mode = "uncond (mask_cond → zero)" if args.uncond_text else "CLIP('') (非零向量)"
+    print(f"文本条件模式: {text_mode}")
+
     # ---------- 加载模型 ----------
-    # 借用 cond_synt_args 从 checkpoint 自动恢复训练参数
     from utils.parser_util import cond_synt_args
     sys.argv = [sys.argv[0],
                 '--model_path', args.model_path,
@@ -419,9 +434,11 @@ def main():
     print("="*60)
 
     train_emb = extract_motion_embeddings_from_mdm(
-        model, train_motions, diffusion, t_probe=args.t_probe)
+        model, train_motions, diffusion, t_probe=args.t_probe,
+        uncond_text=args.uncond_text)
     target_emb = extract_motion_embeddings_from_mdm(
-        model, target_motions, diffusion, t_probe=args.t_probe)
+        model, target_motions, diffusion, t_probe=args.t_probe,
+        uncond_text=args.uncond_text)
 
     visualize_tsne(train_emb, target_emb,
                    os.path.join(args.output_dir, f'distribution_{args.vis_method}.png'),
@@ -433,7 +450,8 @@ def main():
     print("="*60)
 
     train_losses = compute_per_sample_loss(
-        model, diffusion, train_motions, train_kwargs, n_timesteps=10)
+        model, diffusion, train_motions, train_kwargs, n_timesteps=10,
+        uncond_text=args.uncond_text)
 
     target_kwargs = {
         'y': {
@@ -443,7 +461,8 @@ def main():
         }
     }
     target_losses = compute_per_sample_loss(
-        model, diffusion, target_motions, target_kwargs, n_timesteps=10)
+        model, diffusion, target_motions, target_kwargs, n_timesteps=10,
+        uncond_text=args.uncond_text)
 
     train_losses_np = train_losses.numpy()
     target_losses_np = target_losses.numpy()
@@ -465,6 +484,7 @@ def main():
     print("="*60)
 
     report = []
+    report.append(f"文本条件模式: {text_mode}")
     report.append(f"训练集样本数: {len(train_motions)}")
     report.append(f"目标序列数:   {n_target}")
     report.append(f"")

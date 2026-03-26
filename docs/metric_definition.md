@@ -63,20 +63,34 @@ $$\mathcal{L}(x_0) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \left\lVer
 | 马氏距离比 | < 1.5x | 1.5x ~ 2.0x | > 2.0x |
 | k-NN 距离比 | < 1.5x | 1.5x ~ 2.0x | > 2.0x |
 
+**关于文本条件的处理**:
+
+脚本默认开启 `--uncond_text`，通过 `mask_cond(force_mask=True)` 将文本 embedding 置零。这与模型 forward 中 `y['uncond']=True` 的 CFG 无条件分支完全一致，确保只比较运动先验分布，排除文本语义的干扰。
+
+> 注意: 传空串 `''` 仍然会经 CLIP 编码得到非零向量，**不等于**数学意义上的无条件。
+
 **运行脚本**:
 
 ```bash
+# 默认: 关闭文本条件（推荐，只比较运动先验）
 python scripts/verify_ood_distribution.py \
     --model_path save/condmdi/model000500000.pt \
     --target_motion_path /path/to/target_motions.npy \
     --output_dir save/ood_analysis
+
+# 可选: 保留 CLIP 空串编码
+python scripts/verify_ood_distribution.py \
+    --model_path save/condmdi/model000500000.pt \
+    --target_motion_path /path/to/target_motions.npy \
+    --output_dir save/ood_analysis \
+    --no_uncond_text
 ```
 
 输出文件:
 - `distribution_tsne.png` — t-SNE 分布可视化
 - `loss_distribution.png` — 重建损失直方图
 - `distance_comparison.png` — 马氏距离 & k-NN 距离对比图
-- `ood_report.txt` — 综合诊断报告
+- `ood_report.txt` — 综合诊断报告（标注了文本条件模式）
 - `raw_metrics.npz` — 原始数值
 
 ##### 提供先验的模型在条件控制能力上表现差
