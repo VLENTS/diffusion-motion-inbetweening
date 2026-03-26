@@ -361,3 +361,23 @@ $$\mathbf{J}_{t,k}^{\text{smooth}} = \text{SG}(\mathbf{J}_{:,k}^{\text{pred}}, \
 | 方向 2: 分区 impute+recg | impute stop=0 | recg only | ~200-240 | ~0.7-0.9 |
 | 方向 3: +后处理平滑 | 不动 | SG filter | ~250-300 | 0.74 |
 | 方向 1+3 组合 | impute stop=0 | stop=1 + SG | ~180-220 | ~0.7-0.9 |
+
+---
+
+**修正分析（基于 line_gk1 数据）**:
+
+line_gk1 的 11 个 manual joints 已覆盖全部碰撞敏感关节，剩余 11 个自由关节（spine1/2/3, neck, head, left/right_collar, left/right_shoulder, left/right_elbow）本来就不做 impute。不存在"非碰撞关节被硬替换"的问题。
+
+| 配置 | Jitter | Pene | 备注 |
+|------|--------|------|------|
+| GT | 282 | 0.49 | 基线 |
+| line_gk1 | 254 | 0.49 | **已低于 GT** |
+
+line_gk1 的 Jitter 已低于 GT。被锁的 11 关节携带 GT 的 Jitter，自由的 11 关节被模型生成得更平滑，拉低了整体值。
+
+**若仍要继续压低 Jitter**:
+
+| 实验 | 做法 | 预期 Jitter | Pene 风险 |
+|------|------|-----------|----------|
+| line_gk1 + stop=1 | 仅改 `--stop_imputation_at 1` | ~220-240 | 极低（999/1000 步已密集约束） |
+| + 自由关节后处理 | 对 11 个 spine/neck/shoulder/elbow 做 SG 滤波 | 再降 ~10-20 | 零（不碰碰撞关节） |
