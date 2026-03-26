@@ -194,12 +194,121 @@
 | Test-time optimization | 优化 noise 或 intermediate states | ⭐⭐ |
 | 物理后处理 | 仿真器精炼 | ⭐ |
 
-### 5.4 评估指标
+### 5.4 偏移量评估指标
+
+#### 符号定义
+
+设动作序列共 $T$ 帧，人体骨架共 $K$ 个关节。
+
+| 符号 | 定义 |
+|------|------|
+| $\mathbf{J}\_{t,k}^{\text{gt}} \in \mathbb{R}^3$ | 第 $t$ 帧第 $k$ 个关节的 GT 三维位置 |
+| $\mathbf{J}\_{t,k}^{\text{pred}} \in \mathbb{R}^3$ | 第 $t$ 帧第 $k$ 个关节的预测三维位置 |
+| $\mathbf{x}\_t^{\text{gt}} = \mathbf{J}\_{t,0}^{\text{gt}} \in \mathbb{R}^3$ | 第 $t$ 帧 GT 根节点（pelvis）世界坐标 |
+| $\mathbf{x}\_t^{\text{pred}} = \mathbf{J}\_{t,0}^{\text{pred}} \in \mathbb{R}^3$ | 第 $t$ 帧预测根节点世界坐标 |
+| $\hat{\mathbf{J}}\_{t,k} = \mathbf{J}\_{t,k} - \mathbf{J}\_{t,0}$ | 根节点对齐后的局部关节位置 |
+| $T$ | 序列总帧数 |
+| $K$ | 关节总数 |
+
+---
+
+#### (1) 整体偏移量（Global Positional Offset, GPO）
+
+衡量所有帧、所有关节在世界坐标系下的累积位置误差：
+
+$$
+\text{GPO} = \sum_{t=1}^{T} \left( \frac{1}{K} \sum_{k=1}^{K} \left\lVert \mathbf{J}\_{t,k}^{\text{gt}} - \mathbf{J}\_{t,k}^{\text{pred}} \right\rVert\_2 \right)
+$$
+
+等价地，若不取关节均值而是直接对所有关节求和：
+
+$$
+\text{GPO}^{\prime} = \sum_{t=1}^{T} \sum_{k=1}^{K} \left\lVert \mathbf{J}\_{t,k}^{\text{gt}} - \mathbf{J}\_{t,k}^{\text{pred}} \right\rVert\_2
+$$
+
+对应的 **逐帧均值版本**（MPJPE，Mean Per Joint Position Error）：
+
+$$
+\text{MPJPE} = \frac{1}{T} \sum_{t=1}^{T} \frac{1}{K} \sum_{k=1}^{K} \left\lVert \mathbf{J}\_{t,k}^{\text{gt}} - \mathbf{J}\_{t,k}^{\text{pred}} \right\rVert\_2
+$$
+
+---
+
+#### (2) 轨迹偏移量（Trajectory Offset, TrajO）
+
+仅衡量根节点在世界坐标系下的累积轨迹漂移：
+
+$$
+\text{TrajO} = \sum_{t=1}^{T} \left\lVert \mathbf{x}\_t^{\text{gt}} - \mathbf{x}\_t^{\text{pred}} \right\rVert\_2
+$$
+
+对应的均值版本：
+
+$$
+\overline{\text{TrajO}} = \frac{1}{T} \sum_{t=1}^{T} \left\lVert \mathbf{x}\_t^{\text{gt}} - \mathbf{x}\_t^{\text{pred}} \right\rVert\_2
+$$
+
+---
+
+#### (3) 姿态偏移量（Pose Offset, PoseO）
+
+衡量在去除全局平移后、纯粹局部姿态的误差。对每帧先做根节点对齐（root-aligned），再计算关节偏差：
+
+$$
+\hat{\mathbf{J}}\_{t,k}^{\text{gt}} = \mathbf{J}\_{t,k}^{\text{gt}} - \mathbf{J}\_{t,0}^{\text{gt}}, \quad \hat{\mathbf{J}}\_{t,k}^{\text{pred}} = \mathbf{J}\_{t,k}^{\text{pred}} - \mathbf{J}\_{t,0}^{\text{pred}}
+$$
+
+$$
+\text{PoseO} = \sum_{t=1}^{T} \frac{1}{K} \sum_{k=1}^{K} \left\lVert \hat{\mathbf{J}}\_{t,k}^{\text{gt}} - \hat{\mathbf{J}}\_{t,k}^{\text{pred}} \right\rVert\_2
+$$
+
+对应的均值版本（即 root-aligned MPJPE，常记为 **RA-MPJPE**）：
+
+$$
+\text{RA-MPJPE} = \frac{1}{T} \sum_{t=1}^{T} \frac{1}{K} \sum_{k=1}^{K} \left\lVert \hat{\mathbf{J}}\_{t,k}^{\text{gt}} - \hat{\mathbf{J}}\_{t,k}^{\text{pred}} \right\rVert\_2
+$$
+
+> **备注**: GPO $\approx$ TrajO + PoseO。整体偏移可分解为轨迹漂移和局部姿态误差两个正交成分，方便定位问题来源。
+
+---
+
+#### (4) 首帧尾帧整体偏移量（Boundary Frame Offset, BFO）
+
+衡量序列首帧（$t=1$）和尾帧（$t=T$）处的全局关节位置偏差，反映条件约束的遵循程度：
+
+$$
+\text{BFO} = \frac{1}{2} \sum_{t \in \{1, T\}} \frac{1}{K} \sum_{k=1}^{K} \left\lVert \mathbf{J}\_{t,k}^{\text{gt}} - \mathbf{J}\_{t,k}^{\text{pred}} \right\rVert\_2
+$$
+
+也可分别报告首帧和尾帧：
+
+$$
+\text{BFO}\_{\text{first}} = \frac{1}{K} \sum_{k=1}^{K} \left\lVert \mathbf{J}\_{1,k}^{\text{gt}} - \mathbf{J}\_{1,k}^{\text{pred}} \right\rVert\_2
+$$
+
+$$
+\text{BFO}\_{\text{last}} = \frac{1}{K} \sum_{k=1}^{K} \left\lVert \mathbf{J}\_{T,k}^{\text{gt}} - \mathbf{J}\_{T,k}^{\text{pred}} \right\rVert\_2
+$$
+
+---
+
+#### 指标汇总表
+
+| 指标 | 缩写 | 公式核心 | 衡量内容 |
+|------|------|---------|---------|
+| 整体偏移量 | GPO / MPJPE | $\frac{1}{T}\frac{1}{K}\sum_t\sum_k\lVert\mathbf{J}^{gt}-\mathbf{J}^{pred}\rVert_2$ | 全局关节位置总误差 |
+| 轨迹偏移量 | TrajO | $\frac{1}{T}\sum_t\lVert\mathbf{x}^{gt}-\mathbf{x}^{pred}\rVert_2$ | 根节点轨迹漂移 |
+| 姿态偏移量 | PoseO / RA-MPJPE | $\frac{1}{T}\frac{1}{K}\sum_t\sum_k\lVert\hat{\mathbf{J}}^{gt}-\hat{\mathbf{J}}^{pred}\rVert_2$ | 去除平移后的纯姿态误差 |
+| 首帧尾帧偏移量 | BFO | $\frac{1}{K}\sum_k\lVert\mathbf{J}^{gt}-\mathbf{J}^{pred}\rVert_2\big\|_{t\in\{1,T\}}$ | 边界帧条件约束遵循度 |
+
+---
+
+#### 其他辅助指标
+
 | 指标 | 说明 |
 |------|------|
 | FID | 生成动作分布与 GT 分布的差距 |
 | Diversity | 生成动作的多样性 |
-| Keyframe Error | 在关键帧位置与 GT 的 MPJPE |
 | Foot Skating | 脚部滑动量 |
 | Scene Penetration | 与场景的穿透距离 |
 | Contact Accuracy | 接触点的准确率 |
