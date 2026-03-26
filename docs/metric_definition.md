@@ -187,21 +187,19 @@ Line A 用稀疏全关节关键帧保住了姿态，但关键帧间距太大导�
 
 **降低 MPJPE 至 < 0.01 的策略**
 
-**策略 1: 全帧根轨迹约束 + 稀疏全关节关键帧（推荐，直接可做）**
+**策略 1: 全帧根轨迹约束 + 稀疏全关节关键帧（已实现，首选）**
 
 同时施加两层 imputation mask：
 - 第一层：**所有帧** 的 **根节点（pelvis）** 特征 → 锁死轨迹（类似 Line D 的 TrajE=0）
 - 第二层：**每 N 帧** 的 **全关节** 特征 → 保持姿态（类似 Line A 的 RA-MPJPE=0.009）
 
-实现方式：在 `get_keyframes_mask` 中新增一个混合 edit_mode，或在调用处手动叠加两个 mask。
+已在 `utils/editing_util.py` 中新增 `edit_mode='pelvis_dense_sparse'`。
 
-```python
-# 伪代码: 组合 mask
-obs_mask = torch.zeros_like(data, dtype=bool)
-# 层1: 全帧根节点
-obs_mask[:, root_features, :, :all_frames] = True
-# 层2: 每5帧全关节
-obs_mask[:, :, :, ::5] = True
+使用方式：
+
+```bash
+--edit_mode pelvis_dense_sparse --transition_length 5 \
+--imputate --stop_imputation_at 0
 ```
 
 预期效果：TrajE ≈ 0 + RA-MPJPE ≈ 0.009 → MPJPE ≈ 0.009 < 0.01
@@ -226,21 +224,10 @@ obs_mask[:, :, :, ::5] = True
 
 reconstruction guidance 通过梯度将非关键帧的根轨迹也拉向 GT 方向，弥补 imputation 的间隙。
 
-**策略 4: 后处理轨迹对齐（零成本兜底方案）**
-
-生成后不改姿态，只对根节点轨迹做插值对齐：
-
-$$\mathbf{x}_t^{\text{corrected}} = \mathbf{x}_t^{\text{pred}} + \text{lerp}(\Delta_{\text{prev\_kf}}, \Delta_{\text{next\_kf}}, \alpha_t)$$
-
-其中 $\Delta = \mathbf{x}^{\text{gt}} - \mathbf{x}^{\text{pred}}$ 是关键帧处的根节点偏差，$\alpha_t$ 是帧在两个关键帧之间的线性插值系数。
-
-这不改变 RA-MPJPE（姿态不变），但将 TrajE 降到接近 0。
-
 **策略优先级**:
 
 | 策略 | 预期 MPJPE | 实现难度 | 推荐 |
 |------|-----------|---------|------|
-| 策略 1: 根轨迹 + 稀疏关键帧 | ~0.009 | 改 mask 逻辑 | 首选 |
-| 策略 4: 后处理轨迹对齐 | ~0.009 | 几行后处理代码 | 兜底 |
+| 策略 1: 根轨迹 + 稀疏关键帧 | ~0.009 | 已实现 | 首选 |
 | 策略 2: transition_length=2 | ~0.01-0.02 | 改参数 | 快速验证 |
 | 策略 3: +reconstruction guidance | ~0.02-0.03 | 加参数 | 叠加改善 |

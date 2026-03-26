@@ -146,6 +146,16 @@ def get_keyframes_mask(data, lengths, edit_mode='benchmark_sparse', trans_length
             length = int(length)
             obs_joint_mask[i, 0, :, :length] = True
 
+    elif edit_mode == 'pelvis_dense_sparse':
+        # Full-frame root (pelvis) constraint + sparse all-joint keyframes.
+        # Locks trajectory at every frame while preserving pose via keyframes.
+        assert joints_dim in [22, 24]
+        for i, length in enumerate(lengths.cpu().numpy()):
+            length = int(length)
+            obs_joint_mask[i, 0, :, :length] = True
+            kf_indices = np.array(range(length)[::trans_length])
+            obs_joint_mask[i, :, :, kf_indices] = True
+
     elif edit_mode == 'gmd_keyframes':
         # Observe 5 random keyframes
         # used for inference
