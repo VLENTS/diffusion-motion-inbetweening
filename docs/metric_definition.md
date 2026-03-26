@@ -253,3 +253,111 @@ reconstruction guidance 通过梯度将非关键帧的根轨迹也拉向 GT 方�
 | root stride=1 + 全关节 stride=5 | ~0.009 | 改参数 | 首选 |
 | root stride=1 + 全关节 stride=3 | ~0.005-0.007 | 改参数 | 更激进 |
 | 上述 + reconstruction guidance | 再降 ~20-30% | 加参数 | 叠加改善 |
+
+---
+
+#### Jitter vs Penetration 权衡分析
+
+**完整实验数据**:
+
+| 配置 | Jitter | fs_ankle_foot | Pene_% | stop_at | 约束强度 |
+|------|--------|---------------|--------|---------|---------|
+| gt | 282 | 0.018 | 0.49 | - | - |
+| line_b | 219 | 0.010 | 1.38 | 1 | 中（9关节 s=40） |
+| line_c | 209 | 0.016 | 1.23 | 1 | 弱（全关节 s=5） |
+| line_d | 232 | 0.009 | 0.89 | 0 | 中（9关节 s=40） |
+| line_e | 255 | 0.010 | 0.91 | 1 | 弱（仅pelvis） |
+| line_g | 356 | 0.016 | 0.74 | 0 | 强（9关节 s=5） |
+| line_gk | 379 | 0.017 | 0.76 | 0 | 更强（11关节 s=5） |
+| line_gk1 | 254 | 0.018 | 0.49 | 0 | 极强（11关节 s=1） |
+| line_a | 1412 | 0.031 | 1.05 | 0 | 强但无轨迹锁（全关节 s=5） |
+| line_f | 553 | 0.022 | 1.08 | 1 | 弱（8关节 无pelvis） |
+
+**核心发现**:
+
+**1. stop_imputation_at 是 Jitter 的决定性因素**
+
+| stop_at=0（全程 impute） | stop_at=1（最后1步不 impute） |
+|---|---|
+| line_a: 1412, line_d: 232, line_g: 356, line_gk: 379, line_gk1: 254 | line_b: 219, line_c: 209, line_e: 255 |
+
+stop_at=0 时在最后一步仍然对观测位置做硬替换，被替换区域和自由区域之间会产生不连续的"缝合边界"，直接放大高频抖动。stop_at=1 让模型在最后一步自主去噪，平滑缝合边界。
+
+> 但注意 line_d (stop=0, Jitter=232) 反而很低——因为它 joint_stride=40 极稀疏，被 impute 锁住的帧很少，缝合边界也少。
+
+**2. Jitter 与约束密度的关系（stop_at=0 组）**
+
+| 从 line_d → line_g → line_gk → line_gk1 | stride | Jitter |
+|---|---|---|
+| line_d | 40 | 232 |
+| line_g | 5 | 356 |
+| line_gk | 5 | 379 |
+| line_gk1 | 1 | 254 |
+
+stride 从 40→5：Jitter 从 232→356，缝合边界变多。
+stride 从 5→1：Jitter 从 379→254，**反而下降**——因为 stride=1 几乎每帧都被锁住，没有自由帧了，也就没有缝合边界了。
+
+这说明 Jitter 呈倒 U 型：全自由（低 Jitter）→ 混合（高 Jitter）→ 全锁（低 Jitter 但 = GT）。
+
+**3. Pene 与约束的关系**
+
+Pene 最好的是 line_gk1（0.49 = GT 水平）和 line_g（0.74），都是 stop_at=0 + 密约束。
+Pene 最差的是 line_b（1.38），stop_at=1 + 稀疏约束。
+
+**说明锁住碰撞敏感关节（foot/ankle）+ stop_at=0 确实能保 Pene。**
+
+---
+
+**在保持 Pene 的前提下优化 Jitter 的实验设计**:
+
+**方向 1: stop_at 分区策略——对不同关节用不同的 stop_at**
+
+核心思路：碰撞敏感关节（ankle/foot）全程 impute（stop=0 保 Pene），其余关节提前停止 impute（stop=1 降 Jitter）。
+
+需要实现**两阶段 mask**：
+
+```python
+# 阶段 1 (t >= 1): 全部观测关节 impute（当前行为）
+inpainting_mask_stage1 = full_obs_mask
+
+# 阶段 2 (t == 0, 最后一步):
+# 只保留 ankle/foot 的 impute，其余关节释放给模型自由平滑
+inpainting_mask_stage2 = ankle_foot_only_mask
+```
+
+代码库已有 `inpainting_mask_second_stage` 和 `impute_until_second_stage` 机制（见 `gaussian_diffusion.py` 第 805-817 行），可以直接复用。
+
+预期：Pene ≈ line_g（foot 仍被锁）+ Jitter 接近 line_c/line_b 水平（~209-219）。
+
+**方向 2: Reconstruction Guidance 替代部分 Imputation**
+
+对非碰撞关节，不做硬替换（impute），改用 reconstruction guidance 做软引导：
+
+```bash
+# 碰撞关节: impute (硬约束，保 Pene)
+# 非碰撞关节: reconstruction guidance (软约束，降 Jitter)
+--reconstruction_guidance --reconstruction_weight 5 \
+--gradient_schedule exponential
+```
+
+Reconstruction guidance 通过梯度将预测拉向 GT，但不做硬替换，因此不会产生缝合边界。
+
+预期：Jitter 显著降低，Pene 由硬锁的 ankle/foot 保持。
+
+**方向 3: 后处理 Jitter 平滑**
+
+生成后对结果做轻量时域低通滤波（Savitzky-Golay 或 Butterworth），只作用于非碰撞关节：
+
+$$\mathbf{J}_{t,k}^{\text{smooth}} = \text{SG}(\mathbf{J}_{:,k}^{\text{pred}}, \text{window}=5, \text{order}=3)_t, \quad k \notin \{\text{ankle, foot}\}$$
+
+不碰 ankle/foot → Pene 不变。窗口大小可调。
+
+**推荐实验矩阵**:
+
+| 实验 | 碰撞关节策略 | 其余关节策略 | 预期 Jitter | 预期 Pene |
+|------|------------|------------|-----------|----------|
+| 基线 line_g | impute stop=0 | impute stop=0 | 356 | 0.74 |
+| 方向 1: 分区 stop | impute stop=0 | impute stop=1 | ~220-250 | ~0.7-0.9 |
+| 方向 2: 分区 impute+recg | impute stop=0 | recg only | ~200-240 | ~0.7-0.9 |
+| 方向 3: +后处理平滑 | 不动 | SG filter | ~250-300 | 0.74 |
+| 方向 1+3 组合 | impute stop=0 | stop=1 + SG | ~180-220 | ~0.7-0.9 |
