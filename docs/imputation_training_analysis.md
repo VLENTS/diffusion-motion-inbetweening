@@ -1,5 +1,7 @@
 # 两种 Imputation 训练策略的本质区别与修正能力分析
 
+> **勘误**：CondMDI 训练时关键帧位置放的也是 clean $\mathbf{x}_0$（见 `mdm_unet.py` 第 781 行：`x = obs_x0 * obs_mask + x * (~obs_mask)`），不是 noised imputation。两者训练时的 imputation 值相同，差异在于模型架构（$\epsilon$-prediction vs $x_0$-prediction）和 $T^*$ 放开时的 mask 处理方式。
+
 ## 1. 训练时两种策略在做什么
 
 设总 diffusion 步数为 $T=1000$，当前时间步为 $t$，clean 动作为 $\mathbf{x}_0$，标准扩散前向过程为：
