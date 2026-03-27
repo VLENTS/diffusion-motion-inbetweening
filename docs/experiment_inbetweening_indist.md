@@ -50,74 +50,79 @@ $$\text{Jitter} = \frac{1}{(T-3) \cdot J} \sum_{t=1}^{T-3} \sum_{j=1}^{J} \frac{
 
 ## 可用模型
 
-### 模型选择依据
+| 角色 | 模型 | 训练时关键帧条件 | 仓库 |
+|------|------|----------------|------|
+| 里程碑模型 | **MDM**（ICLR 2023） | 否 | [GuyTevet/motion-diffusion-model](https://github.com/GuyTevet/motion-diffusion-model) |
+| 动作质量 SOTA | **MoMask**（CVPR 2024） | 否（masked modeling 训练时 mask pattern 覆盖稀疏散布） | [EricGuo5513/momask-codes](https://github.com/EricGuo5513/momask-codes) |
+| 关键帧可控 SOTA | **CondMDI**（SIGGRAPH 2024） | 是（imputation ckpt） | [setarehc/diffusion-motion-inbetweening](https://github.com/setarehc/diffusion-motion-inbetweening) |
 
-| 角色 | 选择 | 理由 |
-|------|------|------|
-| 里程碑模型 | **MDM**（ICLR 2023） | 奠定了运动扩散模型的基础范式（Transformer + diffusion + CLIP），后续 CondMDI/GMD/OmniControl/DNO 全部基于它构建 |
-| 动作质量 SOTA | **MoMask**（CVPR 2024） | HumanML3D 上 FID=0.045（同期最优），非扩散路线（Masked Transformer + RVQ），提供不同技术路线的对照 |
-| 关键帧可控 SOTA | **CondMDI**（SIGGRAPH 2024） | 唯一一个在训练时就学习关键帧条件的模型，支持任意帧数/任意关节子集的灵活约束，关键帧遵循度最高 |
+### MDM（ICLR 2023）
 
-### 模型详情
-
-#### MDM（ICLR 2023）
-
-- **仓库**：[GuyTevet/motion-diffusion-model](https://github.com/GuyTevet/motion-diffusion-model)
 - **预训练 ckpt**：HumanML3D，50-step 快速版可用
 - **架构**：Transformer encoder，$x_0$-prediction
-- **关键帧能力**：推理时通过 inpainting 注入，模型本身未针对关键帧训练
+- **关键帧能力**：模型本身未针对关键帧训练，推理时通过 imputation 或 test-time optimization 注入
 
-#### MoMask（CVPR 2024）
+### MoMask（CVPR 2024）
 
-- **仓库**：[EricGuo5513/momask-codes](https://github.com/EricGuo5513/momask-codes)
 - **预训练 ckpt**：HumanML3D + KIT-ML，可下载
 - **架构**：Masked Transformer + RVQ（非扩散模型）
-- **关键帧能力**：temporal inpainting，mask 掉非关键帧区域让模型填充
+- **关键帧能力**：将关键帧位置 token 保留，非关键帧设为 `[MASK]`，模型迭代填充。论文仅测试过连续区间 inpainting，稀疏关键帧设定为首次尝试
 
-#### CondMDI（SIGGRAPH 2024）
+### CondMDI（SIGGRAPH 2024）
 
-- **仓库**：[setarehc/diffusion-motion-inbetweening](https://github.com/setarehc/diffusion-motion-inbetweening)
 - **预训练 ckpt**：frame 插帧、frame-joint 插帧、uncond，均在 HumanML3D 上训练
 - **架构**：Transformer encoder / U-Net，$\epsilon$-prediction
-- **关键帧能力**：训练时 clean $x_0$ 替换 + mask concat，原生支持关键帧条件
+- **关键帧能力**：训练时 clean $x_0$ 替换 + mask concat（imputation ckpt），推理时同样用 imputation
 
 ---
 
-## 约束方式（按范式整理）
+## 约束方式
 
-### 范式一：硬替换（Imputation）
+### 范式一：Imputation（硬替换）
 
-在采样的每一步（或部分步），将关键帧位置的值强制替换为 GT 派生的值
+采样时关键帧位置用 GT 加噪值硬替换
 
-| 模型 | 约束方式 | 说明 |
-|------|---------|------|
-| MDM | inpainting (RePaint) | 每步在关键帧位置用 $q(x_{t-1} \mid x_0^{gt})$ 替换采样值 |
-| CondMDI | impute (stop=0) | 全程 imputation，关键帧每步被 GT 加噪值替换 |
-| CondMDI | impute (stop=1) | 最后一步不 impute，模型自主平滑最终输出 |
-| CondMDI | dual-phase (t\*=20) | t≥20 密锁，t<20 换稀疏 mask（减少缝合边界） |
+| 模型 | 说明 |
+|------|------|
+| MDM | 模型未针对 imputation 训练，预测和替换互相拉扯，缝合边界严重 |
+| CondMDI | 模型针对 imputation 训练，预测和替换协调，缝合边界较轻 |
 
-**特点**：KF-MPJPE 最低（硬约束保证对齐），但产生缝合边界影响 Jitter
+### 范式二：Test-time Optimization（噪声优化）
 
-### 范式二：梯度引导（Guidance）
+优化初始噪声 $z_T$ 使输出满足关键帧约束（DNO 方法），梯度通过整个采样链反传
 
-不替换采样值，通过对关键帧约束求梯度来引导去噪方向
+| 模型 | 说明 |
+|------|------|
+| MDM | DNO 基于 MDM 构建，直接适用。软约束，无缝合边界，推理慢 |
 
-| 模型 | 约束方式 | 说明 |
-|------|---------|------|
-| CondMDI | reconstruction guidance | 对 $\lVert x_0^{gt} - \hat{x}_0 \rVert^2$ 在关键帧位置求梯度，引导预测 |
-| CondMDI | impute + recg | 硬替换 + 梯度引导叠加 |
+### 范式三：Temporal Inpainting（mask 填充）
 
-**特点**：软约束，不产生缝合边界，Jitter 更优，但 KF-MPJPE 可能偏高
+关键帧位置保留 token，非关键帧设为 `[MASK]`，模型迭代填充
 
-### 范式三：Mask 填充（非扩散）
+| 模型 | 说明 |
+|------|------|
+| MoMask | 非扩散路线。无硬替换边界，但存在 RVQ 量化误差和 4 倍时间下采样精度限制 |
 
-将非关键帧位置 mask 掉，模型直接生成填充
+---
 
-| 模型 | 约束方式 | 说明 |
-|------|---------|------|
-| MoMask | temporal inpainting | mask 非关键帧的 token，Masked Transformer 迭代填充 |
+## 已知效果排序
 
-**特点**：非扩散路线的对照，无 imputation/guidance 机制，质量取决于 masked modeling 的能力
+**对未训练关键帧条件的模型（MDM）**：test-time optimization > imputation
+
+**对已训练关键帧条件的模型（CondMDI）**：imputation 效果最优，不需要额外约束
+
+**MoMask temporal inpainting 在稀疏关键帧设定下**：无已有数据，首次尝试
+
+---
+
+## 理论预估
+
+| 模型 | 约束方式 | KF-MPJPE 预估 | Jitter 预估 | 核心 tradeoff |
+|------|---------|-------------|------------|--------------|
+| MDM | imputation | ≈ 0 | 最高 | 硬替换精确对齐，但模型未训练 imputation，缝合边界最严重 |
+| MDM | test-time opt (DNO) | 中等 | 最低 | 软优化有残差，但全局一致无缝合边界 |
+| MoMask | temporal inpainting | 中等偏高 | 低 | 量化误差 + 时间下采样限制对齐精度，但原生填充无边界 |
+| CondMDI | imputation | ≈ 0 | 中等 | 硬替换精确对齐 + 模型已训练 imputation，综合最优 |
 
 ---
 
@@ -125,10 +130,7 @@ $$\text{Jitter} = \frac{1}{(T-3) \cdot J} \sum_{t=1}^{T-3} \sum_{j=1}^{J} \frac{
 
 | 模型 | 约束方式 | 约束范式 | KF-MPJPE | Jitter |
 |------|---------|---------|----------|--------|
-| MDM | inpainting (RePaint) | 硬替换 | | |
+| MDM | imputation | 硬替换 | | |
+| MDM | test-time opt (DNO) | 噪声优化 | | |
 | MoMask | temporal inpainting | mask 填充 | | |
-| CondMDI | impute (stop=0) | 硬替换 | | |
-| CondMDI | impute (stop=1) | 硬替换 | | |
-| CondMDI | reconstruction guidance | 梯度引导 | | |
-| CondMDI | impute + recg | 硬替换 + 梯度引导 | | |
-| CondMDI | dual-phase (t\*=20) | 硬替换（两阶段） | | |
+| CondMDI | imputation | 硬替换 | | |
