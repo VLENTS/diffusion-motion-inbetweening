@@ -48,11 +48,105 @@ $$\text{Jitter} = \frac{1}{(T-3) \cdot J} \sum_{t=1}^{T-3} \sum_{j=1}^{J} \frac{
 
 ---
 
-## 实验结果
+## 可用模型与约束方式
 
-| 模型 | 约束方式 | KF-MPJPE | Jitter |
-|------|---------|----------|--------|
-| 模型 A | 约束方式一 | | |
-| 模型 A | 约束方式二 | | |
-| 模型 B | 约束方式一 | | |
-| 模型 B | 约束方式二 | | |
+### 1. CondMDI（SIGGRAPH 2024）
+
+- **仓库**：[setarehc/diffusion-motion-inbetweening](https://github.com/setarehc/diffusion-motion-inbetweening)
+- **预训练 ckpt**：frame 插帧、frame-joint 插帧、uncond，均在 HumanML3D 上训练
+- **架构**：Transformer encoder / U-Net，$\epsilon$-prediction
+- **关键帧注入方式**：训练时 clean $x_0$ 替换 + mask concat
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| impute (stop=0) | 全程 imputation，关键帧每步被 GT 加噪值替换 | KF-MPJPE 最低，Jitter 受缝合边界影响 |
+| impute (stop=1) | 最后一步不 impute，模型自主平滑 | Jitter 降低，KF-MPJPE 略升 |
+| impute + recg | imputation + reconstruction guidance 叠加 | 软硬约束结合 |
+| dual-phase (stop=20) | t≥20 密锁，t<20 换稀疏 mask | Jitter 进一步降低，KF-MPJPE 取决于稀疏 mask 设计 |
+
+### 2. OmniControl（ICLR 2024）
+
+- **仓库**：[neu-vi/OmniControl](https://github.com/neu-vi/OmniControl)
+- **预训练 ckpt**：HumanML3D 上训练，可下载
+- **架构**：基于 MDM，ControlNet 风格的 copy branch + analytic guidance
+- **关键帧注入方式**：推理时 analytic spatial guidance + realism guidance，不修改模型输入
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| spatial guidance | 通过梯度引导关节位置匹配目标 | 软约束，不产生缝合边界，Jitter 可能更低 |
+| spatial + realism guidance | 叠加全关节的 realism 引导 | 平衡约束遵循度和动作自然度 |
+
+### 3. DNO（CVPR 2024）
+
+- **仓库**：[korrawe/Diffusion-Noise-Optimization](https://github.com/korrawe/Diffusion-Noise-Optimization)
+- **预训练 ckpt**：基于 MDM + EMA，HumanML3D 上训练
+- **架构**：不改模型，优化 diffusion 初始噪声 $z_T$
+- **关键帧注入方式**：test-time optimization，将关键帧约束作为 loss 反传到 $z_T$
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| noise optimization (keyframe loss) | 优化 $z_T$ 使输出在关键帧处匹配 GT | 无缝合边界，全局一致，但推理慢 |
+| noise optimization (keyframe + velocity loss) | 加入速度平滑正则 | 进一步降低 Jitter |
+
+### 4. GMD（ICCV 2023）
+
+- **仓库**：[korrawe/guided-motion-diffusion](https://github.com/korrawe/guided-motion-diffusion)
+- **预训练 ckpt**：HumanML3D 上训练，可下载
+- **架构**：U-Net，$x_0$-prediction
+- **关键帧注入方式**：推理时 imputation + reconstruction guidance
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| imputation | 关键帧位置硬替换 | 与 CondMDI 类似 |
+| reconstruction guidance | 梯度引导 | 软约束 |
+| imputation + guidance | 两者叠加 | 与 CondMDI impute+recg 对比 |
+
+### 5. PriorMDM（ICLR 2024）
+
+- **仓库**：[priorMDM/priorMDM](https://github.com/priorMDM/priorMDM)
+- **预训练 ckpt**：基于 MDM，HumanML3D 上训练，提供 DiffusionBlending 的微调模型
+- **架构**：MDM 作为先验，DiffusionBlending 融合多个微调模型
+- **关键帧注入方式**：DiffusionBlending 做关节级/轨迹级控制
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| DiffusionBlending | 融合关节控制模型的预测 | 关节级精细控制 |
+
+### 6. MoMask（CVPR 2024）
+
+- **仓库**：[EricGuo5513/momask-codes](https://github.com/EricGuo5513/momask-codes)
+- **预训练 ckpt**：HumanML3D + KIT-ML，可下载
+- **架构**：Masked Transformer + RVQ（非扩散模型）
+- **关键帧注入方式**：temporal inpainting，mask 掉非关键帧让模型填充
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| temporal inpainting | mask 非关键帧区域，模型生成填充 | 非扩散路线的对照组 |
+
+### 7. MDM（ICLR 2023）
+
+- **仓库**：[GuyTevet/motion-diffusion-model](https://github.com/GuyTevet/motion-diffusion-model)
+- **预训练 ckpt**：HumanML3D，50-step 快速版可用
+- **架构**：Transformer encoder，$x_0$-prediction
+- **关键帧注入方式**：推理时 inpainting（RePaint 风格）
+
+| 约束方式 | 说明 | 预期特点 |
+|---------|------|---------|
+| inpainting (RePaint) | 每步在关键帧位置用 GT 加噪替换 | 基础 baseline |
+
+---
+
+## 推荐实验矩阵
+
+按优先级排序，覆盖三种约束范式（硬替换 / 梯度引导 / 噪声优化）：
+
+| 模型 | 约束方式 | 约束范式 | KF-MPJPE | Jitter |
+|------|---------|---------|----------|--------|
+| CondMDI | impute (stop=0) | 硬替换 | | |
+| CondMDI | impute (stop=1) | 硬替换 | | |
+| CondMDI | dual-phase (stop=20) | 硬替换（两阶段） | | |
+| OmniControl | spatial + realism guidance | 梯度引导 | | |
+| DNO | noise optimization | 噪声优化 | | |
+| GMD | imputation + guidance | 硬替换 + 梯度引导 | | |
+| MoMask | temporal inpainting | mask 填充 | | |
+| MDM | inpainting (RePaint) | 硬替换 | | |
