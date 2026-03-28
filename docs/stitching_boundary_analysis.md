@@ -67,9 +67,10 @@ Imputation（stop=0）将关键帧位置的值从模型预测强制替换为 GT�
 
 不是根因，但是最直接的改善路径：通过优化 $z_T$（DNO 方法）可以找到更好的起点
 
-**文献支持**：
+**文献**：
 - InitNO [CVPR 2024]：通过 cross-attention response score 筛选有效的 $z_T$ 区域，提升文本-图像对齐
 - Not All Noises Are Created Equally [2024]：证明生成质量显著依赖 noise inversion stability，$z_T$ 的微小扰动和输出变化之间的关系是高度非线性的
+- DNO [CVPR 2024]：通过优化 $z_T$ 使扩散模型输出满足任意可微约束，在运动编辑任务上优于 guidance 和 imputation 方法
 
 ### 因素 2：低 $t$ 时更新幅度极小
 
@@ -85,17 +86,18 @@ Imputation（stop=0）将关键帧位置的值从模型预测强制替换为 GT�
 
 是部分根因，可操作性高
 
-**文献支持**：
-- GMD [ICCV 2023]：提出 dense signal propagation，将稀疏的空间约束转化为更稠密的引导信号，原因是模型对稀疏约束的感知能力弱
-- ControlNet [ICCV 2023] 相关研究发现：当空间条件信号过于稀疏时，模型的条件遵循能力显著下降，条件信号在空间上越连续密集，遵循精度越高
+**文献**：
+- GMD [ICCV 2023, Karunratanakul et al.]：提出 dense signal propagation，将稀疏的空间约束转化为更稠密的引导信号，原因是模型对稀疏约束的感知能力弱
+- ControlNet [ICCV 2023, Zhang et al.]：当空间条件信号过于稀疏时，模型的条件遵循能力显著下降，条件信号在空间上越连续密集，遵循精度越高
+- When ControlNet Meets Inexplicit Masks [2024]：ControlNet 对不精确/稀疏的空间条件会盲目遵循噪声轮廓，而非鲁棒地解释条件意图
 
 ### 因素 4：条件后验采样的计算不可解性
 
-Diffusion Posterior Sampling is Computationally Intractable [ICML 2024] 严格证明了：在扩散模型中，从条件后验 $p(x_0 \mid y)$ 精确采样是计算不可解的（需要 superpolynomial time），即使无条件采样是高效的
-
-这意味着通过训练时条件注入来近似条件采样的方法（如 CondMDI）存在理论精度上限。但这是 worst-case 复杂度分析，不提供具体模型/任务的精度上限估计方法，无法量化"0.053 中有多少来自这个理论限制"
-
 是理论上限，不可突破但实际中可能不是瓶颈
+
+**文献**：
+- Diffusion Posterior Sampling is Computationally Intractable [ICML 2024, Dou & Song]：严格证明从条件后验 $p(x_0 \mid y)$ 精确采样需要 superpolynomial time，即使无条件采样是高效的。这意味着通过训练时条件注入来近似条件采样的方法存在理论精度上限。但这是 worst-case 复杂度分析，不提供具体模型/任务的精度上限估计方法，无法量化"0.053 中有多少来自这个理论限制"
+- Fast Constrained Sampling in Pre-trained Diffusion Models [2024]：针对条件后验不可解问题，提出使用 tractable probabilistic models 做精确后验计算的替代路径
 
 ### 因素 5：条件注入架构的信号强度
 
@@ -104,6 +106,14 @@ CondMDI 的条件注入方式是 `x = obs_x0 * obs_mask + x_t * (~obs_mask)` 然
 在图像领域，ControlNet 式的条件注入（额外编码器 + attention 层注入）通常比 concat 方式的条件遵循精度更高。在运动领域，OmniControl [ICLR 2024] 采用了 ControlNet 风格的 copy branch 来增强空间条件注入。但 **CondMDI 与 OmniControl 没有在同一 benchmark 同一指标下做过直接对比**，因此"concat 弱于 ControlNet 注入"在运动领域是未验证的假设，不能作为已证实的结论
 
 是潜在根因，图像领域有支持证据，运动领域尚无直接实验验证。可以借鉴图像领域的思路探索更强的条件注入架构
+
+**可能的验证路径**：保持 CondMDI 的一切不变（263 维 HumanML3D 表示、abs_3d、相同训练数据、相同关键帧采样策略），只把条件注入方式从 concat 换成 ControlNet 式——复制一份 Transformer encoder 作为 condition branch，输入关键帧 263 维特征 + mask，通过 zero-conv 将中间层特征注入主 branch 的对应层。唯一变量是条件注入方式，直接比较两者的 KF-MPJPE 即可验证因素 5 是否成立
+
+**文献**：
+- ControlNet [ICCV 2023, Zhang et al.]：提出 trainable copy + zero-conv 的条件注入架构，在图像领域比 concat 方式的空间条件遵循精度更高
+- OmniControl [ICLR 2024, Xie et al.]：将 ControlNet 思想应用于运动生成，用 copy branch 编码关节轨迹控制信号注入 MDM 的 attention 层。但其控制的是关节 xyz 轨迹而非 263 维完整 pose，且使用相对根节点表示，与 CondMDI 的任务设定不直接可比
+- Heeding the Inner Voice [2024]：研究 ControlNet 在不同层的条件注入强度，发现中间层特征反馈可以显著提升条件遵循精度
+- Condition-Prompt Misalignment [2024]：ControlNet 的条件遵循效果高度依赖视觉条件与生成目标的语义对齐程度，当两者不对齐时条件遵循能力显著下降
 
 ### 归因总结
 
