@@ -1,0 +1,140 @@
+# 缝合边界问题的分析与定位
+
+## 问题现象
+
+在使用 imputation（stop=0）做关键帧约束的扩散采样中，最终输出的 Jitter 远高于模型自身生成的动作序列的 Jitter
+
+---
+
+## 实验数据
+
+|  | KF-MPJPE | Jitter | ΔJitter (pred−gt) |
+|---|---|---|---|
+| GT | 0 | 46.86 | 0 |
+| imputation stop=0 | 0.0 | 438.51 | +391.65 |
+| imputation stop=1 | 0.053 | 165.29 | +118.43 |
+
+关键发现：**stop=0 和 stop=1 的非关键帧输出完全相同**（两者之间的非关键帧 MPJPE = 0.0）
+
+---
+
+## 根因分析
+
+### stop=0 和 stop=1 的唯一区别
+
+两者非关键帧输出完全一致，唯一的区别是关键帧位置的值：
+
+| | 关键帧值 | 非关键帧值 | KF-MPJPE | Jitter |
+|---|---|---|---|---|
+| stop=0 | GT（精确） | 模型预测 | 0.0 | 438 |
+| stop=1 | 模型预测 | 模型预测（完全相同） | 0.053 | 165 |
+
+同样的非关键帧值，仅仅将关键帧从"模型预测"换成"精确 GT"，Jitter 从 165 跳到 438，增加了 273
+
+### 根因
+
+**模型生成的全局动作序列并没有做到在关键帧位置与目标关键帧严格匹配**
+
+模型在去噪过程中生成了一条全局平滑的动作序列（Jitter=165），在这条序列中，非关键帧和模型自己预测的关键帧之间是连续协调的。但模型预测的关键帧与实际 GT 关键帧之间存在 0.053 的 MPJPE 误差
+
+Imputation（stop=0）将关键帧位置的值从模型预测强制替换为 GT，这个替换改变了关键帧位置的值但没有改变非关键帧的值。非关键帧原本与模型预测的关键帧平滑衔接，现在被迫与偏移了 0.053 的 GT 关键帧拼接，导致边界处出现不连续
+
+```
+模型预测（全局平滑）:  ... hat_x0[i-1] --- hat_x0[i] --- hat_x0[i+1] ...
+                                             ↓ impute 替换
+最终输出（边界断裂）:  ... hat_x0[i-1] --- GT[i] --- hat_x0[i+1] ...
+                                            ↑
+                                hat_x0[i+1] 与 hat_x0[i] 平滑
+                                hat_x0[i+1] 与 GT[i] 不平滑
+                                差值 = hat_x0[i] - GT[i] = 0.053 MPJPE
+```
+
+### 结论
+
+**问题不是 imputation 的采样机制有缺陷，而是模型本身的关键帧条件遵循能力不足**
+
+模型没有生成一条 Jitter 有严重问题的动作序列——模型自身的 Jitter=165 是合理的。问题是模型在关键帧位置的预测与 GT 有 0.053 的误差，imputation 为修正这个误差做的硬替换打断了模型自己建立的连续性
+
+当前 CondMDI 的条件注入方式（clean $x_0$ 替换 + mask concat）不足以让模型在关键帧位置达到 KF-MPJPE < 0.01 的精度。要解决缝合边界问题，需要提升模型在关键帧位置的预测精度，使得 imputation 的替换偏移量足够小（< 0.01），缝合 Jitter 才能降到可接受范围
+
+---
+
+## 归因分析：为什么模型在关键帧位置的 KF-MPJPE 无法降到 < 0.01
+
+### 因素 1：$z_T$ 起点问题
+
+扩散模型对初始噪声 $z_T$ 敏感，不同的 $z_T$ 会导致显著不同的输出质量，且这种关系高度非线性。当前的 $z_T$ 是随机采样的，模型从这个随机起点出发，可能无法找到一条在关键帧位置精确对齐 GT 的去噪路径
+
+不是根因，但是最直接的改善路径：通过优化 $z_T$（DNO 方法）可以找到更好的起点
+
+**文献**：
+- InitNO [CVPR 2024]：通过 cross-attention response score 筛选有效的 $z_T$ 区域，提升文本-图像对齐
+- Not All Noises Are Created Equally [2024]：证明生成质量显著依赖 noise inversion stability，$z_T$ 的微小扰动和输出变化之间的关系是高度非线性的
+- DNO [CVPR 2024]：通过优化 $z_T$ 使扩散模型输出满足任意可微约束，在运动编辑任务上优于 guidance 和 imputation 方法
+
+### 因素 2：低 $t$ 时更新幅度极小
+
+实验观察到 stop=1 和 stop=20 结果完全相同，说明 $t \leq 20$ 时模型的修正量几乎为零。这是扩散模型的已知特性——低 $t$ 时 $\bar{\alpha}_t \approx 1$，模型的修正步幅 $\propto (1 - \bar{\alpha}_t)$ 趋近零
+
+不是根因，是现象：说明模型在 $t=20$ 时就已经收敛到最终输出。KF-MPJPE = 0.053 在 $t > 20$ 的阶段就已经确定了，后续步骤无法修正
+
+（可以考虑使用 Consistency Models 减少采样步数同时保持质量，提升采样效率）
+
+### 因素 3：关键帧稀疏性
+
+当前关键帧是时间轴上的离散单帧（如仅在 $t_{\text{motion}}=20$ 处约束一帧）。模型对这种稀疏的点约束难以做到精确对齐。将单帧约束扩展为局部区间约束（如 $t_{\text{motion}}=[18,22]$）可以增加条件信号的密度，可能提升模型对原关键帧的遵循能力
+
+是部分根因，可操作性高
+
+**文献**：
+- GMD [ICCV 2023, Karunratanakul et al.]：提出 dense signal propagation，将稀疏的空间约束转化为更稠密的引导信号，原因是模型对稀疏约束的感知能力弱
+- ControlNet [ICCV 2023, Zhang et al.]：当空间条件信号过于稀疏时，模型的条件遵循能力显著下降，条件信号在空间上越连续密集，遵循精度越高
+- When ControlNet Meets Inexplicit Masks [2024]：ControlNet 对不精确/稀疏的空间条件会盲目遵循噪声轮廓，而非鲁棒地解释条件意图
+
+### 因素 4：条件后验采样的计算不可解性
+
+是理论上限，不可突破但实际中可能不是瓶颈
+
+**文献**：
+- Diffusion Posterior Sampling is Computationally Intractable [ICML 2024, Dou & Song]：严格证明从条件后验 $p(x_0 \mid y)$ 精确采样需要 superpolynomial time，即使无条件采样是高效的。这意味着通过训练时条件注入来近似条件采样的方法存在理论精度上限。但这是 worst-case 复杂度分析，不提供具体模型/任务的精度上限估计方法，无法量化"0.053 中有多少来自这个理论限制"
+- Fast Constrained Sampling in Pre-trained Diffusion Models [2024]：针对条件后验不可解问题，提出使用 tractable probabilistic models 做精确后验计算的替代路径
+
+### 因素 5：条件注入架构的信号强度
+
+CondMDI 的条件注入方式是 `x = obs_x0 * obs_mask + x_t * (~obs_mask)` 然后 concat mask。关键帧信息混在输入中，模型需要自己学会区分"条件信号"和"待去噪信号"。当关键帧稀疏时，条件信号在输入中被"稀释"
+
+在图像领域，ControlNet 式的条件注入（额外编码器 + attention 层注入）通常比 concat 方式的条件遵循精度更高。在运动领域，OmniControl [ICLR 2024] 采用了 ControlNet 风格的 copy branch 来增强空间条件注入。但 **CondMDI 与 OmniControl 没有在同一 benchmark 同一指标下做过直接对比**，因此"concat 弱于 ControlNet 注入"在运动领域是未验证的假设，不能作为已证实的结论
+
+是潜在根因，图像领域有支持证据，运动领域尚无直接实验验证。可以借鉴图像领域的思路探索更强的条件注入架构
+
+**可能的验证路径**：保持 CondMDI 的一切不变（263 维 HumanML3D 表示、abs_3d、相同训练数据、相同关键帧采样策略），只把条件注入方式从 concat 换成 ControlNet 式——复制一份 Transformer encoder 作为 condition branch，输入关键帧 263 维特征 + mask，通过 zero-conv 将中间层特征注入主 branch 的对应层。唯一变量是条件注入方式，直接比较两者的 KF-MPJPE 即可验证因素 5 是否成立
+
+**训练设定**：
+- 主 branch：使用 **uncond ckpt**（无关键帧条件），冻结不更新。使用 uncond 而非 frame cond 是为了隔离 ControlNet 的独立贡献——主 branch 完全没有关键帧意识，条件信号只通过 ControlNet branch 注入，最终 KF-MPJPE 完全归因于 ControlNet 的注入能力，可直接和 CondMDI（concat，KF-MPJPE=0.053）对比
+- Copy branch：初始化为主 branch 的权重副本，只训练 copy branch + zero-conv 参数
+- 训练数据/关键帧采样策略：与 CondMDI 完全一致
+
+**训练时间预估**（8 卡 3090）：
+- HumanML3D 训练集 ~14K 序列，CondMDI 完整训练 500K 步单卡约 2-3 天
+- ControlNet branch 只训练 copy branch 参数，主 branch 冻结无梯度计算，且 copy branch 从主 branch 权重初始化起点好，100K-200K 步可收敛
+- 预估 **4-8 小时**（8 卡 3090，200K 步）
+
+**文献**：
+- ControlNet [ICCV 2023, Zhang et al.]：提出 trainable copy + zero-conv 的条件注入架构，在图像领域比 concat 方式的空间条件遵循精度更高
+- OmniControl [ICLR 2024, Xie et al.]：将 ControlNet 思想应用于运动生成，用 copy branch 编码关节轨迹控制信号注入 MDM 的 attention 层。但其控制的是关节 xyz 轨迹而非 263 维完整 pose，且使用相对根节点表示，与 CondMDI 的任务设定不直接可比
+- Heeding the Inner Voice [2024]：研究 ControlNet 在不同层的条件注入强度，发现中间层特征反馈可以显著提升条件遵循精度
+- Condition-Prompt Misalignment [2024]：ControlNet 的条件遵循效果高度依赖视觉条件与生成目标的语义对齐程度，当两者不对齐时条件遵循能力显著下降
+
+### 归因总结
+
+| 因素 | 文献支持 | 是否根因 | 可操作性 |
+|------|---------|---------|---------|
+| 1. $z_T$ 起点 | InitNO, DNO | 不是根因，是改善路径 | 高（DNO 直接可用） |
+| 2. 低 $t$ 不更新 | 扩散模型已知特性 | 不是根因，是现象 | 低 |
+| 3. 关键帧稀疏性 | GMD, ControlNet | 部分根因 | 高（扩展为区间约束） |
+| 4. 条件后验不可解 | ICML 2024 | 理论上限 | 不可突破 |
+| 5. 条件注入架构 | 图像领域有支持，运动领域未验证 | 潜在根因 | 中（需改架构） |
+
+---
+
+## 修复方案

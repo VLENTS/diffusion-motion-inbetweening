@@ -1,0 +1,383 @@
+### 动作序列先验注入目标动作序列时产生显著偏移
+
+#### 符号定义
+
+- $T$：序列总帧数
+- $K$：关节总数
+- $\mathbf{J}_{t,k}^{gt}, \mathbf{J}_{t,k}^{pred} \in \mathbb{R}^3$：第 $t$ 帧第 $k$ 个关节的 GT / 预测三维位置
+- $\mathbf{x}_t = \mathbf{J}_{t,0} \in \mathbb{R}^3$：第 $t$ 帧根节点（pelvis）坐标
+- $\hat{\mathbf{J}}_{t,k} = \mathbf{J}_{t,k} - \mathbf{J}_{t,0}$：根节点对齐后的局部关节位置
+
+#### 评估指标
+
+**整体偏移量（MPJPE）**：所有帧所有关节在世界坐标系下的平均位置误差
+
+$$\text{MPJPE} = \frac{1}{T} \sum_{t=1}^{T} \frac{1}{K} \sum_{k=1}^{K} \left\lVert \mathbf{J}_{t,k}^{gt} - \mathbf{J}_{t,k}^{pred} \right\rVert_2$$
+
+**轨迹偏移量（TrajE）**：根节点在世界坐标系下的平均轨迹漂移
+
+$$\text{TrajE} = \frac{1}{T} \sum_{t=1}^{T} \left\lVert \mathbf{x}_t^{gt} - \mathbf{x}_t^{pred} \right\rVert_2$$
+
+**姿态偏移量（RA-MPJPE）**：每帧先对齐根节点消除全局平移，再计算局部姿态误差
+
+$$\hat{\mathbf{J}}_{t,k}^{gt} = \mathbf{J}_{t,k}^{gt} - \mathbf{J}_{t,0}^{gt}, \quad \hat{\mathbf{J}}_{t,k}^{pred} = \mathbf{J}_{t,k}^{pred} - \mathbf{J}_{t,0}^{pred}$$
+
+$$\text{RA-MPJPE} = \frac{1}{T} \sum_{t=1}^{T} \frac{1}{K} \sum_{k=1}^{K} \left\lVert \hat{\mathbf{J}}_{t,k}^{gt} - \hat{\mathbf{J}}_{t,k}^{pred} \right\rVert_2$$
+
+**首帧尾帧整体偏移量（BFE）**：边界帧处全关节平均位置误差
+
+$$\text{BFE} = \frac{1}{2}\left( \frac{1}{K}\sum_{k=1}^{K}\left\lVert \mathbf{J}_{1,k}^{gt} - \mathbf{J}_{1,k}^{pred} \right\rVert_2 + \frac{1}{K}\sum_{k=1}^{K}\left\lVert \mathbf{J}_{T,k}^{gt} - \mathbf{J}_{T,k}^{pred} \right\rVert_2 \right)$$
+
+> **诊断关系**：MPJPE 可分解为 TrajE（轨迹漂移）+ RA-MPJPE（局部姿态误差），用于定位偏移来源。BFE 单独衡量关键帧约束的遵循程度。
+
+#### 原因分析
+
+##### 目标动作序列在先验分布外
+
+**验证方法**: 使用三种互补手段判定目标序列是否在模型学习的先验分布之外。
+
+**方法 1: Embedding 空间可视化 (t-SNE / UMAP)**
+
+将训练集和目标序列通过 MDM Transformer encoder 提取全局 embedding，降维到 2D 可视化：
+- 若目标序列（红色）聚集在训练集（蓝色）覆盖区域内 → 分布内
+- 若目标序列散布在训练集覆盖区域之外 → OOD
+
+**方法 2: 逐样本 Diffusion 重建损失**
+
+对每个样本在多个 diffusion timestep 上计算模型重建损失 $\mathcal{L}(x_0)$：
+
+$$\mathcal{L}(x_0) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \left\lVert x_0 - \hat{x}_0(x_t, t) \right\rVert^2$$
+
+其中 $\mathcal{T}$ 为均匀采样的时间步子集，$\hat{x}_0$ 为模型预测。OOD 样本的重建损失通常显著高于训练分布内样本。
+
+**方法 3: 特征空间统计距离**
+
+在 embedding 空间计算两组定量指标：
+- **马氏距离**: 每个目标样本到训练集分布（$\mu_{\text{train}}, \Sigma_{\text{train}}$）的马氏距离
+- **k-NN 距离**: 每个目标样本到训练集最近 $k$ 个邻居的平均欧氏距离
+
+**OOD 判定参考标准**:
+| 指标比值（目标/训练） | 分布内 | 边界 | 分布外 |
+|---|---|---|---|
+| 重建损失比 | < 1.2x | 1.2x ~ 1.5x | > 1.5x |
+| 马氏距离比 | < 1.5x | 1.5x ~ 2.0x | > 2.0x |
+| k-NN 距离比 | < 1.5x | 1.5x ~ 2.0x | > 2.0x |
+
+**关于文本条件的处理**:
+
+脚本默认开启 `--uncond_text`，通过 `mask_cond(force_mask=True)` 将文本 embedding 置零。这与模型 forward 中 `y['uncond']=True` 的 CFG 无条件分支完全一致，确保只比较运动先验分布，排除文本语义的干扰。
+
+> 注意: 传空串 `''` 仍然会经 CLIP 编码得到非零向量，**不等于**数学意义上的无条件。
+
+**运行脚本**:
+
+```bash
+# 默认: 关闭文本条件（推荐，只比较运动先验）
+python scripts/verify_ood_distribution.py \
+    --model_path save/condmdi/model000500000.pt \
+    --target_motion_path /path/to/target_motions.npy \
+    --output_dir save/ood_analysis
+
+# 可选: 保留 CLIP 空串编码
+python scripts/verify_ood_distribution.py \
+    --model_path save/condmdi/model000500000.pt \
+    --target_motion_path /path/to/target_motions.npy \
+    --output_dir save/ood_analysis \
+    --no_uncond_text
+```
+
+输出文件:
+- `distribution_tsne.png` — t-SNE 分布可视化
+- `loss_distribution.png` — 重建损失直方图
+- `distance_comparison.png` — 马氏距离 & k-NN 距离对比图
+- `ood_report.txt` — 综合诊断报告（标注了文本条件模式）
+- `raw_metrics.npz` — 原始数值
+
+**实验结果**:
+
+验证设定:
+- 训练参考 = 全量 train.txt 去掉 exclude_range 中的 id
+- 目标 = target_range 对应序列
+- exclude_range: 300001-300013, target_range: 300005-300013
+
+```
+训练集样本数: 500
+目标序列数:   9
+文本条件:     关闭 (uncond)
+
+[重建损失]
+  训练集均值: 0.133541 ± 0.128599
+  目标均值:   0.214753 ± 0.102504
+  比值:       1.61x
+
+[马氏距离]
+  训练集到自身: 14.8838 ± 4.4436
+  目标到训练集: 27.1814 ± 7.8151
+  比值:         1.83x
+
+[k-NN 距离]
+  训练集内部: 4.0257 ± 2.5118
+  目标到训练: 4.5049 ± 0.9057
+  比值:       1.12x
+```
+
+**结果解读**:
+
+三个指标呈现出不一致的信号，这本身揭示了 OOD 的具体模式：
+
+| 指标 | 比值 | 判定 | 含义 |
+|------|------|------|------|
+| 重建损失 | 1.61x | OOD | 模型对这些序列的去噪预测能力显著弱于训练集 |
+| 马氏距离 | 1.83x | 边界 OOD | 在全局分布形状（均值+协方差）上偏离训练集 |
+| k-NN 距离 | 1.12x | 分布内 | 在局部邻域上与训练集某些样本接近 |
+
+这组指标组合指向一个典型模式：**目标序列处于训练分布的低密度尾部区域**。
+
+- k-NN 距离接近（1.12x）说明目标序列并不是一种模型"完全没见过"的运动类型，它们在局部邻域能找到相似的训练样本
+- 但马氏距离偏高（1.83x）说明它们偏离了训练分布的高密度中心区域
+- 重建损失最高（1.61x）说明模型对这个区域的建模精度不足——训练过程中这类样本出现频率低，模型没有充分学习
+
+> 类比：不是"没见过猫"（全新类别），而是"只见过家猫，现在来了一只姿态罕见的猫"（同分布低密度尾部）。
+
+**关于 t-SNE 看不出差异的原因**:
+
+这是预期之中的：
+1. **样本量极度不平衡**：9 个目标点 vs 500 个训练点，在 2D 投影中极易被"淹没"
+2. **t-SNE 不保距**：t-SNE 优化局部邻域结构，会扭曲全局密度差异；两个在高维空间距离较远的点在 2D 中可能被拉到一起
+3. **高维到 2D 信息损失巨大**：512 维 embedding → 2 维，大量区分信息被丢弃
+
+t-SNE/UMAP 在此场景下是**辅助参考**，定量指标（重建损失 + 马氏距离）更可靠。
+
+**结论**: 轻度到中度 OOD。目标序列处于训练分布的低密度尾部，不是分布外的全新类别。三个指标中仅重建损失（1.61x）刚过 OOD 阈值，马氏距离（1.83x）在边界区，k-NN（1.12x）明确在分布内。"目标序列在先验分布外"可以作为偏移的部分解释，但 OOD 程度不严重，不是主要原因。更需要关注第二个假设——模型条件控制能力不足。
+
+##### 提供先验的模型在条件控制能力上表现差
+
+**实验数据**:
+
+| 配置 | MPJPE | TrajE | RA-MPJPE | BFE |
+|------|-------|-------|----------|-----|
+| line_a: `benchmark_sparse` T=5, impute, stop=0 | 0.0505 | 0.0497 | 0.0092 | 0.0137 |
+| line_d: manual kf, impute, stop=0 | 0.0394 | 0.0000 | 0.0394 | 0.0284 |
+
+**诊断: Line A 的误差构成**
+
+| 成分 | 值 | 占 MPJPE 比例 |
+|------|----|-------------|
+| TrajE（轨迹漂移） | 0.0497 | **98.4%** |
+| RA-MPJPE（姿态误差） | 0.0092 | 1.6% |
+
+Line A 的核心问题不是姿态——RA-MPJPE 已经接近 0.01 级别了。**几乎全部误差来自根节点轨迹漂移。**
+
+`benchmark_sparse` + `transition_length=5` 意味着每 5 帧给一个全关节关键帧。在关键帧上模型会被 imputation 强制对齐到 GT，但在两个关键帧之间的 4 帧里，模型对根节点的预测产生了累积漂移。由于 HumanML 的根节点表示是相对位移（帧间增量），这种漂移在长序列上会被放大。
+
+**与 Line D 的对比**:
+
+| | Line A | Line D |
+|---|---|---|
+| 轨迹 | 漂移严重 (0.0497) | 完美 (0.0000) |
+| 姿态 | 很好 (0.0092) | 较差 (0.0394) |
+| 策略 | 稀疏全关节关键帧 | 手动关键帧 + 指定关节 |
+
+Line D 用连续帧的根节点约束锁死了轨迹，但关节覆盖不全导致姿态误差大。
+Line A 用稀疏全关节关键帧保住了姿态，但关键帧间距太大导致轨迹漂移。
+
+**两条线各自拿到了 <0.01 的一半**：Line A 的姿态、Line D 的轨迹。
+
+---
+
+**降低 MPJPE 至 < 0.01 的策略**
+
+**策略 1: 全帧根轨迹约束 + 稀疏全关节关键帧（已实现，首选）**
+
+同时施加两层 imputation mask：
+- 第一层：**所有帧** 的 **根节点（pelvis）** 特征 → 锁死轨迹（类似 Line D 的 TrajE=0）
+- 第二层：**每 N 帧** 的 **全关节** 特征 → 保持姿态（类似 Line A 的 RA-MPJPE=0.009）
+
+已在 `utils/editing_util.py` 中新增 `edit_mode='pelvis_dense_sparse'`。
+
+使用方式：
+
+```bash
+--edit_mode pelvis_dense_sparse --transition_length 5 \
+--imputate --stop_imputation_at 0
+```
+
+预期效果：TrajE ≈ 0 + RA-MPJPE ≈ 0.009 → MPJPE ≈ 0.009 < 0.01
+
+**策略 2: 加密关键帧间距（简单但暴力）**
+
+将 `transition_length` 从 5 降到 2 或 1：
+- `transition_length=2`：每 2 帧一个关键帧，非关键帧只有 1 帧间距，轨迹漂移极小
+- `transition_length=1`：每帧都是关键帧，imputation 将直接复制 GT（MPJPE → 0，但失去生成意义）
+
+权衡：间距越小约束越强，但生成自由度越低。`transition_length=2~3` 可能是平衡点。
+
+**策略 3: Imputation + Reconstruction Guidance 双管齐下**
+
+在 Line A 基础上叠加 reconstruction guidance，专门针对根节点轨迹加强引导：
+
+```bash
+--imputate --stop_imputation_at=0 \
+--reconstruction_guidance --reconstruction_weight=10 \
+--gradient_schedule=exponential
+```
+
+reconstruction guidance 通过梯度将非关键帧的根轨迹也拉向 GT 方向，弥补 imputation 的间隙。
+
+**实验进展（Line A → D → G）**:
+
+| 配置 | MPJPE | TrajE | RA-MPJPE | BFE | 关键帧策略 |
+|------|-------|-------|----------|-----|-----------|
+| line_a | 0.0505 | 0.0497 | 0.0092 | 0.0137 | 全关节 stride=5 |
+| line_d | 0.0394 | 0.0000 | 0.0394 | 0.0284 | root stride=1 + 9关节 stride=40 |
+| line_g | 0.0163 | 0.0000 | 0.0163 | 0.0077 | root stride=1 + 9关节 stride=5 |
+
+趋势分析：
+- D→G：joint stride 40→5，RA-MPJPE 0.039→0.016（关键帧密度有效）
+- G vs A：同为 stride=5，但 G 只有 9/22 关节，A 有 22/22 关节，RA-MPJPE 差 0.007
+- **残余误差完全来自未观测的 13 个关节**（脊柱链、膝、肘、肩、颈、头）
+
+**降至 MPJPE < 0.01 的调整方案**:
+
+在 Line G 基础上，保持 root stride=1 不变：
+
+| 调整 | 做法 | 预期 MPJPE |
+|------|------|-----------|
+| 扩大关节覆盖至全部 22 | 去掉 `--manual_observed_joints` 限制，joint stride=5 | ~0.009 |
+| 全关节 + stride=3 | 全关节，`--manual_observed_joint_stride 3` | ~0.005-0.007 |
+
+**策略优先级**:
+
+| 策略 | 预期 MPJPE | 实现难度 | 推荐 |
+|------|-----------|---------|------|
+| root stride=1 + 全关节 stride=5 | ~0.009 | 改参数 | 首选 |
+| root stride=1 + 全关节 stride=3 | ~0.005-0.007 | 改参数 | 更激进 |
+| 上述 + reconstruction guidance | 再降 ~20-30% | 加参数 | 叠加改善 |
+
+---
+
+#### Jitter vs Penetration 权衡分析
+
+**完整实验数据**:
+
+| 配置 | Jitter | fs_ankle_foot | Pene_% | stop_at | 约束强度 |
+|------|--------|---------------|--------|---------|---------|
+| gt | 282 | 0.018 | 0.49 | - | - |
+| line_b | 219 | 0.010 | 1.38 | 1 | 中（9关节 s=40） |
+| line_c | 209 | 0.016 | 1.23 | 1 | 弱（全关节 s=5） |
+| line_d | 232 | 0.009 | 0.89 | 0 | 中（9关节 s=40） |
+| line_e | 255 | 0.010 | 0.91 | 1 | 弱（仅pelvis） |
+| line_g | 356 | 0.016 | 0.74 | 0 | 强（9关节 s=5） |
+| line_gk | 379 | 0.017 | 0.76 | 0 | 更强（11关节 s=5） |
+| line_gk1 | 254 | 0.018 | 0.49 | 0 | 极强（11关节 s=1） |
+| line_a | 1412 | 0.031 | 1.05 | 0 | 强但无轨迹锁（全关节 s=5） |
+| line_f | 553 | 0.022 | 1.08 | 1 | 弱（8关节 无pelvis） |
+
+**核心发现**:
+
+**1. stop_imputation_at 是 Jitter 的决定性因素**
+
+| stop_at=0（全程 impute） | stop_at=1（最后1步不 impute） |
+|---|---|
+| line_a: 1412, line_d: 232, line_g: 356, line_gk: 379, line_gk1: 254 | line_b: 219, line_c: 209, line_e: 255 |
+
+stop_at=0 时在最后一步仍然对观测位置做硬替换，被替换区域和自由区域之间会产生不连续的"缝合边界"，直接放大高频抖动。stop_at=1 让模型在最后一步自主去噪，平滑缝合边界。
+
+> 但注意 line_d (stop=0, Jitter=232) 反而很低——因为它 joint_stride=40 极稀疏，被 impute 锁住的帧很少，缝合边界也少。
+
+**2. Jitter 与约束密度的关系（stop_at=0 组）**
+
+| 从 line_d → line_g → line_gk → line_gk1 | stride | Jitter |
+|---|---|---|
+| line_d | 40 | 232 |
+| line_g | 5 | 356 |
+| line_gk | 5 | 379 |
+| line_gk1 | 1 | 254 |
+
+stride 从 40→5：Jitter 从 232→356，缝合边界变多。
+stride 从 5→1：Jitter 从 379→254，**反而下降**——因为 stride=1 几乎每帧都被锁住，没有自由帧了，也就没有缝合边界了。
+
+这说明 Jitter 呈倒 U 型：全自由（低 Jitter）→ 混合（高 Jitter）→ 全锁（低 Jitter 但 = GT）。
+
+**3. Pene 与约束的关系**
+
+Pene 最好的是 line_gk1（0.49 = GT 水平）和 line_g（0.74），都是 stop_at=0 + 密约束。
+Pene 最差的是 line_b（1.38），stop_at=1 + 稀疏约束。
+
+**说明锁住碰撞敏感关节（foot/ankle）+ stop_at=0 确实能保 Pene。**
+
+---
+
+**在保持 Pene 的前提下优化 Jitter 的实验设计**:
+
+**方向 1: stop_at 分区策略——对不同关节用不同的 stop_at**
+
+核心思路：碰撞敏感关节（ankle/foot）全程 impute（stop=0 保 Pene），其余关节提前停止 impute（stop=1 降 Jitter）。
+
+需要实现**两阶段 mask**：
+
+```python
+# 阶段 1 (t >= 1): 全部观测关节 impute（当前行为）
+inpainting_mask_stage1 = full_obs_mask
+
+# 阶段 2 (t == 0, 最后一步):
+# 只保留 ankle/foot 的 impute，其余关节释放给模型自由平滑
+inpainting_mask_stage2 = ankle_foot_only_mask
+```
+
+代码库已有 `inpainting_mask_second_stage` 和 `impute_until_second_stage` 机制（见 `gaussian_diffusion.py` 第 805-817 行），可以直接复用。
+
+预期：Pene ≈ line_g（foot 仍被锁）+ Jitter 接近 line_c/line_b 水平（~209-219）。
+
+**方向 2: Reconstruction Guidance 替代部分 Imputation**
+
+对非碰撞关节，不做硬替换（impute），改用 reconstruction guidance 做软引导：
+
+```bash
+# 碰撞关节: impute (硬约束，保 Pene)
+# 非碰撞关节: reconstruction guidance (软约束，降 Jitter)
+--reconstruction_guidance --reconstruction_weight 5 \
+--gradient_schedule exponential
+```
+
+Reconstruction guidance 通过梯度将预测拉向 GT，但不做硬替换，因此不会产生缝合边界。
+
+预期：Jitter 显著降低，Pene 由硬锁的 ankle/foot 保持。
+
+**方向 3: 后处理 Jitter 平滑**
+
+生成后对结果做轻量时域低通滤波（Savitzky-Golay 或 Butterworth），只作用于非碰撞关节：
+
+$$\mathbf{J}_{t,k}^{\text{smooth}} = \text{SG}(\mathbf{J}_{:,k}^{\text{pred}}, \text{window}=5, \text{order}=3)_t, \quad k \notin \{\text{ankle, foot}\}$$
+
+不碰 ankle/foot → Pene 不变。窗口大小可调。
+
+**推荐实验矩阵**:
+
+| 实验 | 碰撞关节策略 | 其余关节策略 | 预期 Jitter | 预期 Pene |
+|------|------------|------------|-----------|----------|
+| 基线 line_g | impute stop=0 | impute stop=0 | 356 | 0.74 |
+| 方向 1: 分区 stop | impute stop=0 | impute stop=1 | ~220-250 | ~0.7-0.9 |
+| 方向 2: 分区 impute+recg | impute stop=0 | recg only | ~200-240 | ~0.7-0.9 |
+| 方向 3: +后处理平滑 | 不动 | SG filter | ~250-300 | 0.74 |
+| 方向 1+3 组合 | impute stop=0 | stop=1 + SG | ~180-220 | ~0.7-0.9 |
+
+---
+
+**修正分析（基于 line_gk1 数据）**:
+
+line_gk1 的 11 个 manual joints 已覆盖全部碰撞敏感关节，剩余 11 个自由关节（spine1/2/3, neck, head, left/right_collar, left/right_shoulder, left/right_elbow）本来就不做 impute。不存在"非碰撞关节被硬替换"的问题。
+
+| 配置 | Jitter | Pene | 备注 |
+|------|--------|------|------|
+| GT | 282 | 0.49 | 基线 |
+| line_gk1 | 254 | 0.49 | **已低于 GT** |
+
+line_gk1 的 Jitter 已低于 GT。被锁的 11 关节携带 GT 的 Jitter，自由的 11 关节被模型生成得更平滑，拉低了整体值。
+
+**若仍要继续压低 Jitter**:
+
+| 实验 | 做法 | 预期 Jitter | Pene 风险 |
+|------|------|-----------|----------|
+| line_gk1 + stop=1 | 仅改 `--stop_imputation_at 1` | ~220-240 | 极低（999/1000 步已密集约束） |
+| + 自由关节后处理 | 对 11 个 spine/neck/shoulder/elbow 做 SG 滤波 | 再降 ~10-20 | 零（不碰碰撞关节） |
