@@ -109,6 +109,16 @@ CondMDI 的条件注入方式是 `x = obs_x0 * obs_mask + x_t * (~obs_mask)` 然
 
 **可能的验证路径**：保持 CondMDI 的一切不变（263 维 HumanML3D 表示、abs_3d、相同训练数据、相同关键帧采样策略），只把条件注入方式从 concat 换成 ControlNet 式——复制一份 Transformer encoder 作为 condition branch，输入关键帧 263 维特征 + mask，通过 zero-conv 将中间层特征注入主 branch 的对应层。唯一变量是条件注入方式，直接比较两者的 KF-MPJPE 即可验证因素 5 是否成立
 
+**训练设定**：
+- 主 branch：使用 **uncond ckpt**（无关键帧条件），冻结不更新。使用 uncond 而非 frame cond 是为了隔离 ControlNet 的独立贡献——主 branch 完全没有关键帧意识，条件信号只通过 ControlNet branch 注入，最终 KF-MPJPE 完全归因于 ControlNet 的注入能力，可直接和 CondMDI（concat，KF-MPJPE=0.053）对比
+- Copy branch：初始化为主 branch 的权重副本，只训练 copy branch + zero-conv 参数
+- 训练数据/关键帧采样策略：与 CondMDI 完全一致
+
+**训练时间预估**（8 卡 3090）：
+- HumanML3D 训练集 ~14K 序列，CondMDI 完整训练 500K 步单卡约 2-3 天
+- ControlNet branch 只训练 copy branch 参数，主 branch 冻结无梯度计算，且 copy branch 从主 branch 权重初始化起点好，100K-200K 步可收敛
+- 预估 **4-8 小时**（8 卡 3090，200K 步）
+
 **文献**：
 - ControlNet [ICCV 2023, Zhang et al.]：提出 trainable copy + zero-conv 的条件注入架构，在图像领域比 concat 方式的空间条件遵循精度更高
 - OmniControl [ICLR 2024, Xie et al.]：将 ControlNet 思想应用于运动生成，用 copy branch 编码关节轨迹控制信号注入 MDM 的 attention 层。但其控制的是关节 xyz 轨迹而非 263 维完整 pose，且使用相对根节点表示，与 CondMDI 的任务设定不直接可比
